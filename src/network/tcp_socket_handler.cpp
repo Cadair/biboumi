@@ -32,6 +32,22 @@ Botan::TLS::Session_Manager_In_Memory TCPSocketHandler::session_manager(TCPSocke
 # define UIO_FASTIOV 8
 #endif
 
+#ifdef CARES_FOUND
+ares_channel SocketHandler::channel;
+
+void on_hostname_resolved(void* arg, int status, int timeouts, struct hostent* hostent)
+{
+  TCPSocketHandler* socket_handler = static_cast<TCPSocketHandler*>(arg);
+  if (status != ARES_SUCCESS)
+    {
+      socket_handler->close();
+      socket_handler->on_connection_failed(ares_strerror(status));
+      return;
+    }
+  socket_handler->fill_ares_addrinfo(hostent);
+}
+#endif
+
 using namespace std::string_literals;
 using namespace std::chrono_literals;
 
@@ -42,6 +58,10 @@ TCPSocketHandler::TCPSocketHandler(std::shared_ptr<Poller> poller):
   use_tls(false),
   connected(false),
   connecting(false)
+#ifdef CARES_FOUND
+  ,resolved(false),
+  cares_addrinfo(nullptr)
+#endif
 {}
 
 void TCPSocketHandler::init_socket(const struct addrinfo* rp)
@@ -73,8 +93,31 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
   if (!this->connecting)
     {
       log_info("Trying to connect to " << address << ":" << port);
-      // Get the addrinfo from getaddrinfo, only if this is the first call
-      // of this function.
+      // Get the addrinfo from getaddrinfo (or ares_gethostbyname), only if
+      // this is the first call of this function.
+#ifdef CARES_FOUND
+      if (!this->resolved)
+        {
+          // Start the asynchronous process of resolving the hostname. Once
+          // the addresses have been found and `resolved` has been set to true
+          // (but connecting will still be false), TCPSocketHandler::connect()
+          // needs to be called, again.
+
+          // TODO use ares_getaddrinfo when it exist. Also use AF_UNSPEC in
+          // that case
+          log_debug("Start resolving " << address.data());
+          ares_gethostbyname(TCPSocketHandler::channel, address.data(), AF_INET,
+                             &on_hostname_resolved, this);
+          return;
+        }
+      else
+        {
+          // The c-ares resolved the hostname and the available addresses
+          // where saved in the cares_addrinfo linked list. Now, just use
+          // this list to try to connect.
+          addr_res = this->cares_addrinfo;
+        }
+#else
       struct addrinfo hints;
       memset(&hints, 0, sizeof(struct addrinfo));
       hints.ai_flags = 0;
@@ -94,6 +137,7 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
       // Make sure the alloced structure is always freed at the end of the
       // function
       sg.add_callback([&addr_res](){ freeaddrinfo(addr_res); });
+#endif
     }
   else
     { // This function is called again, use the saved addrinfo structure,
@@ -416,3 +460,35 @@ void TCPSocketHandler::on_tls_activated()
   this->send_data("");
 }
 #endif // BOTAN_FOUND
+
+#ifdef CARES_FOUND
+void TCPSocketHandler::fill_ares_addrinfo(const struct hostent* hostent)
+{
+  struct addrinfo* prev = nullptr;
+  char** address = hostent->h_addr_list;
+  while (*address++)
+    {
+      struct addrinfo* current = new struct addrinfo;
+      current->ai_flags = 0;
+      current->ai_family = hostent->h_addrtype;
+      current->ai_socktype = SOCK_STREAM;
+      current->ai_protocol = 0;
+      current->ai_addrlen = sizeof(struct sockaddr_in);
+
+      struct sockaddr_in* addr = new struct sockaddr_in;
+      addr->sin_family = hostent->h_addrtype;
+      // only handle numeric port, not service names.
+      const uint16_t port = strtoul(this->port.data(), nullptr, 10);
+      addr->sin_port = htons(port);
+      addr->sin_addr.s_addr = reinterpret_cast<struct in_addr*>(address)->s_addr;
+      current->ai_addr = reinterpret_cast<struct sockaddr*>(addr);
+      current->ai_next = nullptr;
+      current->ai_canonname = nullptr;
+      if (prev)
+        prev->ai_next = current;
+      else
+        this->cares_addrinfo = current;
+      prev = current;
+    }
+}
+#endif  // CARES_FOUND

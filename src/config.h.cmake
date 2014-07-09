@@ -4,4 +4,5 @@
 #cmakedefine SYSTEMDDAEMON_FOUND
 #cmakedefine POLLER ${POLLER}
 #cmakedefine BOTAN_FOUND
+#cmakedefine CARES_FOUND
 #cmakedefine BIBOUMI_VERSION "${BIBOUMI_VERSION}"

@@ -1,7 +1,11 @@
 #ifndef SOCKET_HANDLER_HPP
 # define SOCKET_HANDLER_HPP
 
+#include <config.h>
 #include <memory>
+#ifdef CARES_FOUND
+# include <ares.h>
+#endif
 
 class Poller;
 
@@ -21,6 +25,10 @@ public:
   virtual bool is_connected() const = 0;
   socket_t get_socket() const
   { return this->socket; }
+#ifdef CARES_FOUND
+  static int ares_init()
+  { return ::ares_init(&SocketHandler::channel); }
+#endif
 
 protected:
   /**
@@ -32,6 +40,12 @@ protected:
    * The handled socket.
    */
   socket_t socket;
+#ifdef CARES_FOUND
+  /**
+   * Common channel used in common by all ares call
+   */
+  static ares_channel channel;
+#endif
 
 private:
   SocketHandler(const SocketHandler&) = delete;

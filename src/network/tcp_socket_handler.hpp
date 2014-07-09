@@ -16,6 +16,10 @@
 
 #include "config.h"
 
+#ifdef CARES_FOUND
+# include <ares.h>
+#endif
+
 #ifdef BOTAN_FOUND
 # include <botan/botan.h>
 # include <botan/tls_client.h>
@@ -109,6 +113,10 @@ public:
   bool is_connected() const;
   bool is_connecting() const;
 
+#ifdef CARES_FOUND
+  void fill_ares_addrinfo(const struct hostent* hostent);
+#endif
+
 private:
   /**
    * Initialize the socket with the parameters contained in the given
@@ -184,7 +192,7 @@ private:
    */
   std::list<std::string> out_buf;
   /**
-   * Keep the details of the addrinfo the triggered a EINPROGRESS error when
+   * Keep the details of the addrinfo that triggered a EINPROGRESS error when
    * connect()ing to it, to reuse it directly when connect() is called
    * again.
    */
@@ -224,6 +232,24 @@ protected:
   bool connected;
   bool connecting;
 
+#ifdef CARES_FOUND
+  /**
+   * Whether or not the DNS resolution was successfully done
+   */
+  bool resolved;
+  /**
+   * When using c-ares to resolve the host asynchronously, we need the
+   * c-ares callback to fill a structure (a struct addrinfo, for
+   * compatibility with getaddrinfo and the rest of the code that works when
+   * c-ares is not used) with all returned values (for example an IPv6 and
+   * an IPv4). The next call of connect() will then try all these values
+   * (exactly like we do with the result of getaddrinfo) and save the one
+   * that worked (or returned EINPROGRESS) in the other struct addrinfo (see
+   * the members addrinfo, ai_addrlen, and ai_addr).
+   */
+  struct addrinfo* cares_addrinfo;
+#endif  // CARES_FOUND
+
 private:
   TCPSocketHandler(const TCPSocketHandler&) = delete;
   TCPSocketHandler(TCPSocketHandler&&) = delete;
@@ -257,5 +283,9 @@ private:
   std::string pre_buf;
 #endif // BOTAN_FOUND
 };
+
+#ifdef CARES_FOUND
+void on_hostname_resolved(void* arg, int status, int timeouts, struct hostent* hostent);
+#endif
 
 #endif // SOCKET_HANDLER_INCLUDED

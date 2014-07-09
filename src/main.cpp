@@ -1,4 +1,3 @@
-#include <network/tcp_socket_handler.hpp>
 #include <xmpp/xmpp_component.hpp>
 #include <utils/timed_events.hpp>
 #include <network/poller.hpp>
@@ -10,6 +9,11 @@
 #include <atomic>
 
 #include <signal.h>
+
+#ifdef CARES_FOUND
+# include <ares.h>
+# include <network/socket_handler.hpp>
+#endif
 
 // A flag set by the SIGINT signal handler.
 static volatile std::atomic<bool> stop(false);
@@ -66,6 +70,20 @@ int main(int ac, char** av)
     return config_help("password");
   if (hostname.empty())
     return config_help("hostname");
+
+#ifdef CARES_FOUND
+  int ares_error;
+  if ((ares_error = ares_library_init(ARES_LIB_INIT_ALL)) != 0)
+    {
+      log_error("Failed to initialize c-ares lib: " << ares_strerror(ares_error));
+      return -1;
+    }
+  if ((ares_error = SocketHandler::ares_init()) != ARES_SUCCESS)
+    {
+      log_error("Failed to initialize c-ares channel: " << ares_strerror(ares_error));
+      return -1;
+    }
+#endif
 
   auto p = std::make_shared<Poller>();
   auto xmpp_component = std::make_shared<XmppComponent>(p,

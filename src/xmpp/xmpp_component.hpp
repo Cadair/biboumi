@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <memory>
 #include <string>
+#include <map>
 
 #define STREAM_NS        "http://etherx.jabber.org/streams"
 #define COMPONENT_NS     "jabber:component:accept"
@@ -23,6 +24,13 @@
 #define STREAMS_NS       "urn:ietf:params:xml:ns:xmpp-streams"
 #define VERSION_NS       "jabber:iq:version"
 #define ADHOC_NS         "http://jabber.org/protocol/commands"
+#define PING_NS          "urn:xmpp:ping"
+
+/**
+ * A callback called when the waited iq result is received (it is matched
+ * against the iq id)
+ */
+using iq_responder_callback_t = std::function<void(Bridge* bridge, const Stanza& stanza)>;
 
 /**
  * An XMPP component, communicating with an XMPP server using the protocole
@@ -38,7 +46,7 @@ public:
 
   void on_connection_failed(const std::string& reason) override final;
   void on_connected() override final;
-  void on_connection_close() override final;
+  void on_connection_close(const std::string& error) override final;
   void parse_in_buffer(const size_t size) override final;
 
   /**
@@ -172,20 +180,15 @@ public:
                      const std::string& author,
                      const std::string& jid_to);
   /**
-   * Send a presence type=error with a conflict element
-   */
-  void send_nickname_conflict_error(const std::string& muc_name,
-                                    const std::string& nickname,
-                                    const std::string& jid_to);
-  /**
    * Send a generic presence error
    */
   void send_presence_error(const std::string& muc_name,
-                      const std::string& nickname,
-                      const std::string& jid_to,
-                      const std::string& type,
-                      const std::string& condition,
-                      const std::string& text);
+                           const std::string& nickname,
+                           const std::string& jid_to,
+                           const std::string& type,
+                           const std::string& condition,
+                           const std::string& error_code,
+                           const std::string& text);
   /**
    * Send a presence from the MUC indicating a change in the role and/or
    * affiliation of a participant
@@ -216,6 +219,12 @@ public:
   void send_iq_version_request(const std::string& from,
                                const std::string& jid_to);
   /**
+   * Send a ping request
+   */
+  void send_ping_request(const std::string& from,
+                         const std::string& jid_to,
+                         const std::string& id);
+  /**
    * Send an empty iq of type result
    */
   void send_iq_result(const std::string& id, const std::string& to_jid, const std::string& from);
@@ -233,9 +242,11 @@ public:
    */
   bool ever_auth;
   /**
-   * Whether or not the last connection+auth attempt was successful
+   * Whether or not this is the first consecutive try on connecting to the
+   * XMPP server.  We use this to delay the connection attempt for a few
+   * seconds, if it is not the first try.
    */
-  bool last_auth;
+  bool first_connection_try;
 
 private:
   /**
@@ -260,6 +271,14 @@ private:
 
   std::unordered_map<std::string, std::function<void(const Stanza&)>> stanza_handlers;
   AdhocCommandsHandler adhoc_commands_handler;
+
+  /**
+   * A map of id -> callback.  When we want to wait for an iq result, we add
+   * the callback to this map, with the iq id as the key. When an iq result
+   * is received, we look for a corresponding callback in this map. If
+   * found, we call it and remove it.
+   */
+  std::map<std::string, iq_responder_callback_t> waiting_iq;
 
   /**
    * One bridge for each user of the component. Indexed by the user's full

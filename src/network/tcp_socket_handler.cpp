@@ -183,7 +183,7 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
           this->ai_addrlen = rp->ai_addrlen;
           memcpy(&this->ai_addr, rp->ai_addr, this->ai_addrlen);
           memcpy(&this->addrinfo, rp, sizeof(struct addrinfo));
-          this->addrinfo.ai_addr = &this->ai_addr;
+          this->addrinfo.ai_addr = reinterpret_cast<struct sockaddr*>(&this->ai_addr);
           this->addrinfo.ai_next = nullptr;
           // If the connection has not succeeded or failed in 5s, we consider
           // it to have failed
@@ -251,22 +251,20 @@ ssize_t TCPSocketHandler::do_recv(void* recv_buf, const size_t buf_size)
   ssize_t size = ::recv(this->socket, recv_buf, buf_size, 0);
   if (0 == size)
     {
-      this->on_connection_close();
+      this->on_connection_close("");
       this->close();
     }
   else if (-1 == size)
     {
       log_warning("Error while reading from socket: " << strerror(errno));
-      if (this->connecting)
-        {
-          this->close();
-          this->on_connection_failed(strerror(errno));
-        }
+      // Remember if we were connecting, or already connected when this
+      // happened, because close() sets this->connecting to false
+      const auto were_connecting = this->connecting;
+      this->close();
+      if (were_connecting)
+        this->on_connection_failed(strerror(errno));
       else
-        {
-          this->close();
-          this->on_connection_close();
-        }
+        this->on_connection_close(strerror(errno));
     }
   return size;
 }
@@ -289,7 +287,7 @@ void TCPSocketHandler::on_send()
   if (res < 0)
     {
       log_error("sendmsg failed: " << strerror(errno));
-      this->on_connection_close();
+      this->on_connection_close(strerror(errno));
       this->close();
     }
   else

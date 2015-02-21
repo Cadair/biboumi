@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.6)
 
 project(biboumi)
 
-set(${PROJECT_NAME}_VERSION_MAJOR 1)
+set(${PROJECT_NAME}_VERSION_MAJOR 2)
 set(${PROJECT_NAME}_VERSION_MINOR 0)
 set(${PROJECT_NAME}_VERSION_SUFFIX "~dev")
 
@@ -18,12 +18,32 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__FILENAME__='\"$(subst ${CMAKE_SOURCE
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules/")
 include(FindEXPAT)
 find_package(EXPAT REQUIRED)
-find_package(Iconv REQUIRED)
-find_package(Libuuid REQUIRED)
-find_package(Libidn)
-find_package(SystemdDaemon)
-find_package(Botan)
-find_package(Cares)
+find_package(ICONV REQUIRED)
+find_package(LIBUUID REQUIRED)
+
+if(WITH_LIBIDN)
+  find_package(LIBIDN REQUIRED)
+elseif(NOT WITHOUT_LIBIDN)
+  find_package(LIBIDN)
+endif()
+
+if(WITH_SYSTEMD)
+  find_package(SYSTEMD REQUIRED)
+elseif(NOT WITHOUT_SYSTEMD)
+  find_package(SYSTEMD)
+endif()
+
+if(WITH_BOTAN)
+  find_package(BOTAN REQUIRED)
+elseif(NOT WITHOUT_BOTAN)
+  find_package(BOTAN)
+endif()
+
+if(WITH_CARES)
+  find_package(CARES REQUIRED)
+elseif(NOT WITHOUT_CARES)
+  find_package(CARES)
+endif()
 
 #
 ## Get the software version

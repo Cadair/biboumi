@@ -39,7 +39,7 @@ static std::set<std::string> kickable_errors{
 XmppComponent::XmppComponent(std::shared_ptr<Poller> poller, const std::string& hostname, const std::string& secret):
   TCPSocketHandler(poller),
   ever_auth(false),
-  last_auth(false),
+  first_connection_try(true),
   served_hostname(hostname),
   secret(secret),
   authenticated(false),
@@ -87,6 +87,7 @@ void XmppComponent::send_stanza(const Stanza& stanza)
 
 void XmppComponent::on_connection_failed(const std::string& reason)
 {
+  this->first_connection_try = false;
   log_error("Failed to connect to the XMPP server: " << reason);
 #ifdef SYSTEMDDAEMON_FOUND
   sd_notifyf(0, "STATUS=Failed to connect to the XMPP server: %s", reason.data());
@@ -96,6 +97,7 @@ void XmppComponent::on_connection_failed(const std::string& reason)
 void XmppComponent::on_connected()
 {
   log_info("connected to XMPP server");
+  this->first_connection_try = true;
   XmlNode node("", nullptr);
   node.set_name("stream:stream");
   node["xmlns"] = COMPONENT_NS;
@@ -108,9 +110,16 @@ void XmppComponent::on_connected()
   this->send_pending_data();
 }
 
-void XmppComponent::on_connection_close()
+void XmppComponent::on_connection_close(const std::string& error)
 {
-  log_info("XMPP server closed connection");
+  if (error.empty())
+    {
+      log_info("XMPP server closed connection");
+    }
+  else
+    {
+      log_info("XMPP server closed connection: " << error);
+    }
 }
 
 void XmppComponent::parse_in_buffer(const size_t size)
@@ -162,7 +171,6 @@ void XmppComponent::on_remote_stream_open(const XmlNode& node)
       return ;
     }
 
-  this->last_auth = false;
   // Try to authenticate
   char digest[HASH_LENGTH * 2 + 1];
   sha1nfo sha1;
@@ -270,7 +278,6 @@ void XmppComponent::handle_handshake(const Stanza& stanza)
   (void)stanza;
   this->authenticated = true;
   this->ever_auth = true;
-  this->last_auth = true;
   log_info("Authenticated with the XMPP server");
 #ifdef SYSTEMDDAEMON_FOUND
   sd_notify(0, "READY=1");
@@ -279,7 +286,6 @@ void XmppComponent::handle_handshake(const Stanza& stanza)
   uint64_t usec;
   if (sd_watchdog_enabled(0, &usec) > 0)
     {
-      std::chrono::microseconds delay(usec);
       TimedEventsManager::instance().add_event(TimedEvent(
              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::microseconds(usec / 2)),
              []() { sd_notify(0, "WATCHDOG=1"); }));
@@ -332,7 +338,10 @@ void XmppComponent::handle_presence(const Stanza& stanza)
           const std::string own_nick = bridge->get_own_nick(iid);
           if (!own_nick.empty() && own_nick != to.resource)
             bridge->send_irc_nick_change(iid, to.resource);
-          bridge->join_irc_channel(iid, to.resource);
+          XmlNode* x = stanza.get_child("x", MUC_NS);
+          XmlNode* password = x ? x->get_child("password", MUC_NS): nullptr;
+          bridge->join_irc_channel(iid, to.resource,
+                                   password ? password->get_inner() : "");
         }
       else if (type == "unavailable")
         {
@@ -472,14 +481,20 @@ void XmppComponent::handle_iq(const Stanza& stanza)
             {
               std::string nick = child->get_tag("nick");
               std::string role = child->get_tag("role");
-              if (!nick.empty() && role == "none")
-                {               // This is a kick
-                  std::string reason;
-                  XmlNode* reason_el = child->get_child("reason", MUC_ADMIN_NS);
-                  if (reason_el)
-                    reason = reason_el->get_inner();
+              std::string affiliation = child->get_tag("affiliation");
+              if (!nick.empty())
+                {
                   Iid iid(to.local);
-                  bridge->send_irc_kick(iid, nick, reason, id, from);
+                  if (role == "none")
+                    {               // This is a kick
+                      std::string reason;
+                      XmlNode* reason_el = child->get_child("reason", MUC_ADMIN_NS);
+                      if (reason_el)
+                        reason = reason_el->get_inner();
+                      bridge->send_irc_kick(iid, nick, reason, id, from);
+                    }
+                  else
+                    bridge->forward_affiliation_role_change(iid, nick, affiliation, role);
                   stanza_error.disable();
                 }
             }
@@ -548,6 +563,26 @@ void XmppComponent::handle_iq(const Stanza& stanza)
               stanza_error.disable();
             }
         }
+      else if ((query = stanza.get_child("ping", PING_NS)))
+        {
+          Iid iid(to.local);
+          if (iid.is_user)
+            { // Ping any user (no check on the nick done ourself)
+              bridge->send_irc_user_ping_request(iid.get_server(),
+                                                 iid.get_local(), id, from, to_str);
+            }
+          else if (iid.is_channel && !to.resource.empty())
+            { // Ping a room participant (we check if the nick is in the room)
+              bridge->send_irc_participant_ping_request(iid,
+                                                        to.resource, id, from, to_str);
+            }
+          else
+            { // Ping a channel, a server or the gateway itself
+              bridge->on_gateway_ping(iid.get_server(),
+                                     id, from, to_str);
+            }
+          stanza_error.disable();
+        }
     }
   else if (type == "result")
     {
@@ -569,6 +604,15 @@ void XmppComponent::handle_iq(const Stanza& stanza)
             os = os_node->get_inner();
           const Iid iid(to.local);
           bridge->send_xmpp_version_to_irc(iid, name, version, os);
+        }
+      else
+        {
+          const auto it = this->waiting_iq.find(id);
+          if (it != this->waiting_iq.end())
+            {
+              it->second(bridge, stanza);
+              this->waiting_iq.erase(it);
+            }
         }
     }
   error_type = "cancel";
@@ -904,41 +948,18 @@ void XmppComponent::kick_user(const std::string& muc_name,
   this->send_stanza(presence);
 }
 
-void XmppComponent::send_nickname_conflict_error(const std::string& muc_name,
-                                                 const std::string& nickname,
-                                                 const std::string& jid_to)
-{
-  Stanza presence("presence");
-  presence["from"] = muc_name + "@" + this->served_hostname + "/" + nickname;
-  presence["to"] = jid_to;
-  XmlNode x("x");
-  x["xmlns"] = MUC_NS;
-  x.close();
-  presence.add_child(std::move(x));
-  XmlNode error("error");
-  error["by"] = muc_name + "@" + this->served_hostname;
-  error["type"] = "cancel";
-  error["code"] = "409";
-  XmlNode conflict("conflict");
-  conflict["xmlns"] = STANZA_NS;
-  conflict.close();
-  error.add_child(std::move(conflict));
-  error.close();
-  presence.add_child(std::move(error));
-  presence.close();
-  this->send_stanza(presence);
-}
-
 void XmppComponent::send_presence_error(const std::string& muc_name,
-                                   const std::string& nickname,
-                                   const std::string& jid_to,
-                                   const std::string& type,
-                                   const std::string& condition,
-                                   const std::string&)
+                                        const std::string& nickname,
+                                        const std::string& jid_to,
+                                        const std::string& type,
+                                        const std::string& condition,
+                                        const std::string& error_code,
+                                        const std::string& /* text */)
 {
   Stanza presence("presence");
   presence["from"] = muc_name + "@" + this->served_hostname + "/" + nickname;
   presence["to"] = jid_to;
+  presence["type"] = "error";
   XmlNode x("x");
   x["xmlns"] = MUC_NS;
   x.close();
@@ -946,6 +967,8 @@ void XmppComponent::send_presence_error(const std::string& muc_name,
   XmlNode error("error");
   error["by"] = muc_name + "@" + this->served_hostname;
   error["type"] = type;
+  if (!error_code.empty())
+    error["code"] = error_code;
   XmlNode subnode(condition);
   subnode["xmlns"] = STANZA_NS;
   subnode.close();
@@ -1085,10 +1108,43 @@ void XmppComponent::send_iq_version_request(const std::string& from,
   this->send_stanza(iq);
 }
 
+void XmppComponent::send_ping_request(const std::string& from,
+                                      const std::string& jid_to,
+                                      const std::string& id)
+{
+  Stanza iq("iq");
+  iq["type"] = "get";
+  iq["id"] = id;
+  iq["from"] = from + "@" + this->served_hostname;
+  iq["to"] = jid_to;
+  XmlNode ping("ping");
+  ping["xmlns"] = PING_NS;
+  ping.close();
+  iq.add_child(std::move(ping));
+  iq.close();
+  this->send_stanza(iq);
+
+  auto result_cb = [from, id](Bridge* bridge, const Stanza& stanza)
+    {
+      Jid to(stanza.get_tag("to"));
+      if (to.local != from)
+        {
+          log_error("Received a corresponding ping result, but the 'to' from "
+                    "the response mismatches the 'from' of the request");
+        }
+      else
+        bridge->send_irc_ping_result(from, id);
+    };
+  this->waiting_iq[id] = result_cb;
+}
+
 void XmppComponent::send_iq_result(const std::string& id, const std::string& to_jid, const std::string& from_local_part)
 {
   Stanza iq("iq");
-  iq["from"] = from_local_part + "@" + this->served_hostname;
+  if (!from_local_part.empty())
+    iq["from"] = from_local_part + "@" + this->served_hostname;
+  else
+    iq["from"] = this->served_hostname;
   iq["to"] = to_jid;
   iq["id"] = id;
   iq["type"] = "result";

@@ -221,7 +221,7 @@ as toto on the channel #bar (as long as these two channels are on the same
 IRC server).  By default you will receive private messages from the “global”
 user (aka nickname!irc.example.com@biboumi.example.com), unless you
 previously sent a message to an in-room participant (something like
-#test%irc.example.com@biboumi.example.com/nickname), in which case future
+\#test%irc.example.com@biboumi.example.com/nickname), in which case future
 messages from that same user will be received from that same “in-room” JID.
 
 ### Notices
@@ -293,6 +293,28 @@ between IRC modes and XMPP features is as follow:
 `+v`
 
   Sets the participant’s role to `participant` and its affiliation to `member`.
+
+Similarly, when a biboumi user changes some participant's affiliation or role, biboumi translates that in an IRC mode change.
+
+Affiliation set to `none`
+
+  Sets mode to -vhoaq
+
+Affiliation set to `member`
+
+  Sets mode to +v-hoaq
+
+Role set to `moderator`
+
+  Sets mode to +h-oaq
+
+Affiliation set to `admin`
+
+  Sets mode to +o-aq
+
+Affiliation set to `owner`
+
+  Sets mode to +a-q
 
 ### Ad-hoc commands
 

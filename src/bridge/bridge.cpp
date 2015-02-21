@@ -1,12 +1,15 @@
 #include <bridge/bridge.hpp>
 #include <bridge/colors.hpp>
 #include <xmpp/xmpp_component.hpp>
+#include <xmpp/xmpp_stanza.hpp>
 #include <irc/irc_message.hpp>
 #include <network/poller.hpp>
 #include <utils/encoding.hpp>
 #include <utils/tolower.hpp>
 #include <logger/logger.hpp>
+#include <utils/revstr.hpp>
 #include <utils/split.hpp>
+#include <xmpp/jid.hpp>
 #include <stdexcept>
 #include <iostream>
 #include <tuple>
@@ -105,7 +108,7 @@ IrcClient* Bridge::get_irc_client(const std::string& hostname)
     }
 }
 
-bool Bridge::join_irc_channel(const Iid& iid, const std::string& username)
+bool Bridge::join_irc_channel(const Iid& iid, const std::string& username, const std::string& password)
 {
   IrcClient* irc = this->get_irc_client(iid.get_server(), username);
   if (iid.get_local().empty())
@@ -132,7 +135,7 @@ bool Bridge::join_irc_channel(const Iid& iid, const std::string& username)
     }
   if (irc->is_channel_joined(iid.get_local()) == false)
     {
-      irc->send_join_command(iid.get_local());
+      irc->send_join_command(iid.get_local(), password);
       return true;
     }
   return false;
@@ -180,6 +183,72 @@ void Bridge::send_channel_message(const Iid& iid, const std::string& body)
     }
 }
 
+void Bridge::forward_affiliation_role_change(const Iid& iid, const std::string& nick,
+                                             const std::string& affiliation,
+                                             const std::string& role)
+{
+  IrcClient* irc = this->get_irc_client(iid.get_server());
+  if (!irc)
+    return;
+  IrcChannel* chan = irc->get_channel(iid.get_local());
+  if (!chan || !chan->joined)
+    return;
+  IrcUser* user = chan->find_user(nick);
+  if (!user)
+    return;
+  // For each affiliation or role, we have a “maximal” mode that we want to
+  // set. We must remove any superior mode at the same time. For example if
+  // the user already has +o mode, and we set its affiliation to member, we
+  // remove the +o mode, and add +v.  For each “superior” mode (for example,
+  // for +v, the superior modes are 'h', 'a', 'o' and 'q') we check if that
+  // user has it, and if yes we remove that mode
+
+  std::size_t nb = 1;               // the number of times the nick must be
+                                    // repeated in the argument list
+  std::string modes;                // The string of modes to
+                                    // add/remove. For example "+v-aoh"
+  std::vector<char> modes_to_remove; // List of modes to check for removal
+  if (affiliation == "none")
+    {
+      modes = "";
+      nb = 0;
+      modes_to_remove = {'v', 'h', 'o', 'a', 'q'};
+    }
+  else if (affiliation == "member")
+    {
+      modes = "+v";
+      modes_to_remove = {'h', 'o', 'a', 'q'};
+    }
+  else if (role == "moderator")
+    {
+      modes = "+h";
+      modes_to_remove = {'o', 'a', 'q'};
+    }
+  else if (affiliation == "admin")
+    {
+      modes = "+o";
+      modes_to_remove = {'a', 'q'};
+    }
+  else if (affiliation == "owner")
+    {
+      modes = "+a";
+      modes_to_remove = {'q'};
+    }
+  else
+    return;
+  for (const char mode: modes_to_remove)
+    if (user->modes.find(mode) != user->modes.end())
+      {
+        modes += "-"s + mode;
+        nb++;
+      }
+  if (modes.empty())
+    return;
+  std::vector<std::string> args(nb, nick);
+  args.insert(args.begin(), modes);
+  irc->send_mode_command(iid.get_local(), args);
+}
+
 void Bridge::send_private_message(const Iid& iid, const std::string& body, const std::string& type)
 {
   if (iid.get_local().empty() || iid.get_server().empty())
@@ -220,45 +289,49 @@ void Bridge::send_irc_kick(const Iid& iid, const std::string& target, const std:
                            const std::string& iq_id, const std::string& to_jid)
 {
   IrcClient* irc = this->get_irc_client(iid.get_server());
-  if (irc)
+
+  if (!irc)
+    return;
+
+  irc->send_kick_command(iid.get_local(), target, reason);
+  irc_responder_callback_t cb = [this, target, iq_id, to_jid, iid](const std::string& irc_hostname,
+                                                                   const IrcMessage& message) -> bool
     {
-      irc->send_kick_command(iid.get_local(), target, reason);
-      this->add_waiting_iq([this, target, iq_id, to_jid, iid](const std::string& irc_hostname, const IrcMessage& message){
-          if (irc_hostname != iid.get_server())
+      if (irc_hostname != iid.get_server())
+        return false;
+      if (message.command == "KICK" && message.arguments.size() >= 2)
+        {
+          const std::string target_later = message.arguments[1];
+          const std::string chan_name_later = utils::tolower(message.arguments[0]);
+          if (target_later != target || chan_name_later != iid.get_local())
             return false;
-          if (message.command == "KICK" && message.arguments.size() >= 2)
-            {
-              const std::string target_later = message.arguments[1];
-              const std::string chan_name_later = utils::tolower(message.arguments[0]);
-              if (target_later != target || chan_name_later != iid.get_local())
-                return false;
-              this->xmpp->send_iq_result(iq_id, to_jid, std::to_string(iid));
-            }
-          else if (message.command == "401" && message.arguments.size() >= 2)
-            {
-              const std::string target_later = message.arguments[1];
-              if (target_later != target)
-                return false;
-              std::string error_message = "No such nick";
-              if (message.arguments.size() >= 3)
-                error_message = message.arguments[2];
-              this->xmpp->send_stanza_error("iq", to_jid, std::to_string(iid), iq_id, "cancel", "item-not-found",
-                                            error_message, false);
-            }
-          else if (message.command == "482" && message.arguments.size() >= 2)
-            {
-              const std::string chan_name_later = utils::tolower(message.arguments[1]);
-              if (chan_name_later != iid.get_local())
-                return false;
-              std::string error_message = "You're not channel operator";
-              if (message.arguments.size() >= 3)
-                error_message = message.arguments[2];
-              this->xmpp->send_stanza_error("iq", to_jid, std::to_string(iid), iq_id, "cancel", "not-allowed",
-                                            error_message, false);
-            }
-          return true;
-        });
-    }
+          this->xmpp->send_iq_result(iq_id, to_jid, std::to_string(iid));
+        }
+      else if (message.command == "401" && message.arguments.size() >= 2)
+        {
+          const std::string target_later = message.arguments[1];
+          if (target_later != target)
+            return false;
+          std::string error_message = "No such nick";
+          if (message.arguments.size() >= 3)
+            error_message = message.arguments[2];
+          this->xmpp->send_stanza_error("iq", to_jid, std::to_string(iid), iq_id, "cancel", "item-not-found",
+                                        error_message, false);
+        }
+      else if (message.command == "482" && message.arguments.size() >= 2)
+        {
+          const std::string chan_name_later = utils::tolower(message.arguments[1]);
+          if (chan_name_later != iid.get_local())
+            return false;
+          std::string error_message = "You're not channel operator";
+          if (message.arguments.size() >= 3)
+            error_message = message.arguments[2];
+          this->xmpp->send_stanza_error("iq", to_jid, std::to_string(iid), iq_id, "cancel", "not-allowed",
+                                        error_message, false);
+        }
+      return true;
+    };
+  this->add_waiting_irc(std::move(cb));
 }
 
 void Bridge::set_channel_topic(const Iid& iid, const std::string& subject)
@@ -275,16 +348,100 @@ void Bridge::send_xmpp_version_to_irc(const Iid& iid, const std::string& name, c
   this->send_private_message(iid, "\01VERSION "s + result + "\01", "NOTICE");
 }
 
+void Bridge::send_irc_ping_result(const Iid& iid, const std::string& id)
+{
+  this->send_private_message(iid, "\01PING "s + utils::revstr(id), "NOTICE");
+}
+
+void Bridge::send_irc_user_ping_request(const std::string& irc_hostname, const std::string& nick,
+                                        const std::string& iq_id, const std::string& to_jid,
+                                        const std::string& from_jid)
+{
+  Iid iid(nick + "!" + irc_hostname);
+  this->send_private_message(iid, "\01PING " + iq_id + "\01");
+
+  irc_responder_callback_t cb = [this, nick, iq_id, to_jid, irc_hostname, from_jid](const std::string& hostname, const IrcMessage& message) -> bool
+    {
+      if (irc_hostname != hostname)
+        return false;
+      IrcUser user(message.prefix);
+      const std::string body = message.arguments[1];
+      if (message.command == "NOTICE" && user.nick == nick &&
+          message.arguments.size() >= 2 && body.substr(0, 6) == "\01PING ")
+        {
+          const std::string id = body.substr(6, body.size() - 6);
+          if (id != iq_id)
+            return false;
+          Jid jid(from_jid);
+          this->xmpp->send_iq_result(iq_id, to_jid, jid.local);
+          return true;
+        }
+      if (message.command == "401" && message.arguments.size() >= 2
+          && message.arguments[1] == nick)
+        {
+          std::string error_message = "No such nick";
+          if (message.arguments.size() >= 3)
+            error_message = message.arguments[2];
+          this->xmpp->send_stanza_error("iq", to_jid, from_jid, iq_id, "cancel", "service-unavailable",
+                                        error_message, true);
+          return true;
+        }
+
+      return false;
+    };
+  this->add_waiting_irc(std::move(cb));
+}
+
+void Bridge::send_irc_participant_ping_request(const Iid& iid, const std::string& nick,
+                                               const std::string& iq_id, const std::string& to_jid,
+                                               const std::string& from_jid)
+{
+  IrcClient* irc = this->get_irc_client(iid.get_server());
+  if (!irc)
+    {
+      this->xmpp->send_stanza_error("iq", to_jid, from_jid, iq_id, "cancel", "item-not-found",
+                                    "Not connected to IRC server"s + iid.get_server(), true);
+      return;
+    }
+  IrcChannel* chan = irc->get_channel(iid.get_local());
+  if (!chan->joined)
+    {
+      this->xmpp->send_stanza_error("iq", to_jid, from_jid, iq_id, "cancel", "not-allowed",
+                                    "", true);
+      return;
+    }
+  if (chan->get_self()->nick != nick && !chan->find_user(nick))
+    {
+      this->xmpp->send_stanza_error("iq", to_jid, from_jid, iq_id, "cancel", "item-not-found",
+                                    "Recipient not in room", true);
+      return;
+    }
+
+  // The user is in the room, send it a direct PING
+  this->send_irc_user_ping_request(iid.get_server(), nick, iq_id, to_jid, from_jid);
+}
+
+void Bridge::on_gateway_ping(const std::string& irc_hostname, const std::string& iq_id, const std::string& to_jid,
+                             const std::string& from_jid)
+{
+  Jid jid(from_jid);
+  if (irc_hostname.empty() || this->get_irc_client(irc_hostname))
+    this->xmpp->send_iq_result(iq_id, to_jid, jid.local);
+  else
+    this->xmpp->send_stanza_error("iq", to_jid, from_jid, iq_id, "cancel", "service-unavailable",
+                                  "", true);
+}
+
 void Bridge::send_irc_version_request(const std::string& irc_hostname, const std::string& target,
                                       const std::string& iq_id, const std::string& to_jid,
                                       const std::string& from_jid)
 {
   Iid iid(target + "!" + irc_hostname);
   this->send_private_message(iid, "\01VERSION\01");
-
   // TODO, add a timer to remove that waiting iq if the server does not
   // respond with a matching command before n seconds
-  this->add_waiting_iq([this, target, iq_id, to_jid, irc_hostname, from_jid](const std::string& hostname, const IrcMessage& message){
+  irc_responder_callback_t cb = [this, target, iq_id, to_jid, irc_hostname, from_jid](const std::string& hostname, const IrcMessage& message) -> bool
+    {
       if (irc_hostname != hostname)
         return false;
       IrcUser user(message.prefix);
@@ -307,9 +464,9 @@ void Bridge::send_irc_version_request(const std::string& irc_hostname, const std
           return true;
         }
       return false;
-    });
+    };
+  this->add_waiting_irc(std::move(cb));
 }
-
 
 void Bridge::send_message(const Iid& iid, const std::string& nick, const std::string& body, const bool muc)
 {
@@ -331,9 +488,11 @@ void Bridge::send_message(const Iid& iid, const std::string& nick, const std::st
     }
 }
 
-void Bridge::send_join_failed(const Iid& iid, const std::string& nick, const std::string& type, const std::string& condition, const std::string& text)
+void Bridge::send_presence_error(const Iid& iid, const std::string& nick,
+                                 const std::string& type, const std::string& condition,
+                                 const std::string& error_code, const std::string& text)
 {
-  this->xmpp->send_presence_error(std::to_string(iid), nick, this->user_jid, type, condition, text);
+  this->xmpp->send_presence_error(std::to_string(iid), nick, this->user_jid, type, condition, error_code, text);
 }
 
 void Bridge::send_muc_leave(Iid&& iid, std::string&& nick, const std::string& message, const bool self)
@@ -387,7 +546,7 @@ void Bridge::send_user_join(const std::string& hostname,
                              affiliation, role, this->user_jid, self);
 }
 
-void Bridge::send_topic(const std::string& hostname, const std::string& chan_name, const std::string topic)
+void Bridge::send_topic(const std::string& hostname, const std::string& chan_name, const std::string& topic)
 {
   this->xmpp->send_topic(chan_name + "%" + hostname, this->make_xmpp_body(topic), this->user_jid);
 }
@@ -412,7 +571,7 @@ void Bridge::kick_muc_user(Iid&& iid, const std::string& target, const std::stri
 
 void Bridge::send_nickname_conflict_error(const Iid& iid, const std::string& nickname)
 {
-  this->xmpp->send_nickname_conflict_error(std::to_string(iid), nickname, this->user_jid);
+  this->xmpp->send_presence_error(std::to_string(iid), nickname, this->user_jid, "cancel", "conflict", "409", "");
 }
 
 void Bridge::send_affiliation_role_change(const Iid& iid, const std::string& target, const char mode)
@@ -427,6 +586,15 @@ void Bridge::send_affiliation_role_change(const Iid& iid, const std::string& tar
 void Bridge::send_iq_version_request(const std::string& nick, const std::string& hostname)
 {
   this->xmpp->send_iq_version_request(nick + "!" + hostname, this->user_jid);
+}
+
+void Bridge::send_xmpp_ping_request(const std::string& nick, const std::string& hostname,
+                                    const std::string& id)
+{
+  // Use revstr because the forwarded ping to target XMPP user must not be
+  // the same that the request iq, but we also need to get it back easily
+  // (revstr again)
+  this->xmpp->send_ping_request(nick + "!" + hostname, this->user_jid, utils::revstr(id));
 }
 
 void Bridge::set_preferred_from_jid(const std::string& nick, const std::string& full_jid)
@@ -445,18 +613,18 @@ void Bridge::remove_preferred_from_jid(const std::string& nick)
     this->preferred_user_from.erase(it);
 }
 
-void Bridge::add_waiting_iq(iq_responder_callback_t&& callback)
+void Bridge::add_waiting_irc(irc_responder_callback_t&& callback)
 {
-  this->waiting_iq.emplace_back(std::move(callback));
+  this->waiting_irc.emplace_back(std::move(callback));
 }
 
-void Bridge::trigger_response_iq(const std::string& irc_hostname, const IrcMessage& message)
+void Bridge::trigger_on_irc_message(const std::string& irc_hostname, const IrcMessage& message)
 {
-  auto it = this->waiting_iq.begin();
-  while (it != this->waiting_iq.end())
+  auto it = this->waiting_irc.begin();
+  while (it != this->waiting_irc.end())
     {
       if ((*it)(irc_hostname, message) == true)
-        it = this->waiting_iq.erase(it);
+        it = this->waiting_irc.erase(it);
       else
         ++it;
     }

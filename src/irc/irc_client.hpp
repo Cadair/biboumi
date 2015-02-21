@@ -8,6 +8,7 @@
 #include <network/tcp_socket_handler.hpp>
 
 #include <unordered_map>
+#include <utility>
 #include <memory>
 #include <vector>
 #include <string>
@@ -41,7 +42,7 @@ public:
   /**
    * Close the connection, remove us from the poller
    */
-  void on_connection_close() override final;
+  void on_connection_close(const std::string& error) override final;
   /**
    * Parse the data we have received so far and try to get one or more
    * complete messages from it.
@@ -81,7 +82,7 @@ public:
   /**
    * Send the JOIN irc command.
    */
-  void send_join_command(const std::string& chan_name);
+  void send_join_command(const std::string& chan_name, const std::string& password);
   /**
    * Send a PRIVMSG command for a channel
    * Return true if the message was actually sent
@@ -172,6 +173,10 @@ public:
    */
   void on_nickname_conflict(const IrcMessage& message);
   /**
+   * Idem, but for when the user changes their nickname too quickly
+   */
+  void on_nickname_change_too_fast(const IrcMessage& message);
+  /**
    * Handles most errors from the server by just forwarding the message to the user.
    */
   void on_generic_error(const IrcMessage& message);
@@ -241,12 +246,13 @@ private:
    */
   DummyIrcChannel dummy_channel;
   /**
-   * A list of chan we want to join, but we need a response 001 from
-   * the server before sending the actual JOIN commands. So we just keep the
-   * channel names in a list, and send the JOIN commands for each of them
-   * whenever the WELCOME message is received.
+   * A list of chan we want to join (tuples with the channel name and the
+   * password, if any), but we need a response 001 from the server before
+   * sending the actual JOIN commands. So we just keep the channel names in
+   * a list, and send the JOIN commands for each of them whenever the
+   * WELCOME message is received.
    */
-  std::vector<std::string> channels_to_join;
+  std::vector<std::tuple<std::string, std::string>> channels_to_join;
   /**
    * This flag indicates that the server is completely joined (connection
    * has been established, we are authentified and we have a nick)
@@ -285,6 +291,10 @@ private:
    * connection succeeds on that port.
    */
   std::stack<std::pair<std::string, bool>> ports_to_try;
+  /**
+   * A set of (lowercase) nicknames to which we sent a private message.
+   */
+  std::set<std::string> nicks_to_treat_as_private;
 
   IrcClient(const IrcClient&) = delete;
   IrcClient(IrcClient&&) = delete;
@@ -317,6 +327,7 @@ static const std::unordered_map<std::string, irc_callback_t> irc_callbacks = {
   {"366", &IrcClient::on_channel_completely_joined},
   {"432", &IrcClient::on_erroneous_nickname},
   {"433", &IrcClient::on_nickname_conflict},
+  {"438", &IrcClient::on_nickname_change_too_fast},
   {"001", &IrcClient::on_welcome_message},
   {"PART", &IrcClient::on_part},
   {"ERROR", &IrcClient::on_error},

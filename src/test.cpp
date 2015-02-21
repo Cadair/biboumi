@@ -10,6 +10,7 @@
 #include <config/config.hpp>
 #include <bridge/colors.hpp>
 #include <utils/tolower.hpp>
+#include <utils/revstr.hpp>
 #include <irc/irc_user.hpp>
 #include <utils/split.hpp>
 #include <xmpp/jid.hpp>
@@ -161,6 +162,9 @@ int main()
   std::cout << lowercase << std::endl;
   assert(lowercase == "coucou les copains ♥");
 
+  const std::string ltr = "coucou";
+  assert(utils::revstr(ltr) == "uocuoc");
+
   /**
    * XML parsing
    */
@@ -218,7 +222,7 @@ int main()
   IrcUser user2("coucou!~other@host.bla", prefixes);
   assert(user2.nick == "coucou");
   assert(user2.host == "~other@host.bla");
-  assert(user2.modes.size() == 0);
+  assert(user2.modes.empty());
   assert(user2.modes.find('a') == user2.modes.end());
 
   /**
@@ -284,7 +288,12 @@ int main()
   // Jidprep
   const std::string& badjid("~zigougou™@EpiK-7D9D1FDE.poez.io/Boujour/coucou/slt™");
   const std::string correctjid = jidprep(badjid);
+  std::cout << correctjid << std::endl;
   assert(correctjid == "~zigougoutm@epik-7d9d1fde.poez.io/Boujour/coucou/sltTM");
+  // Check that the cache do not break things when we prep the same string
+  // multiple times
+  assert(jidprep(badjid) == "~zigougoutm@epik-7d9d1fde.poez.io/Boujour/coucou/sltTM");
+  assert(jidprep(badjid) == "~zigougoutm@epik-7d9d1fde.poez.io/Boujour/coucou/sltTM");
 
   const std::string& badjid2("Zigougou@poez.io");
   const std::string correctjid2 = jidprep(badjid2);

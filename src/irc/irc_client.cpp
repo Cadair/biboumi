@@ -74,11 +74,12 @@ void IrcClient::on_connection_failed(const std::string& reason)
   if (this->ports_to_try.empty())
     {
       // Send an error message for all room that the user wanted to join
-      for (const std::string& channel: this->channels_to_join)
+      for (const auto& tuple: this->channels_to_join)
         {
-          Iid iid(channel + "%" + this->hostname);
-          this->bridge->send_join_failed(iid, this->current_nick,
-                                         "cancel", "item-not-found", reason);
+          Iid iid(std::get<0>(tuple) + "%" + this->hostname);
+          this->bridge->send_presence_error(iid, this->current_nick,
+                                            "cancel", "item-not-found",
+                                            "", reason);
         }
     }
   else                          // try the next port
@@ -93,9 +94,11 @@ void IrcClient::on_connected()
   this->send_pending_data();
 }
 
-void IrcClient::on_connection_close()
+void IrcClient::on_connection_close(const std::string& error_msg)
 {
-  static const std::string message = "Connection closed by remote server.";
+  std::string message = "Connection closed by remote server.";
+  if (!error_msg.empty())
+    message += ": " + error_msg;
   const IrcMessage error{"ERROR", {message}};
   this->on_error(error);
   log_warning(message);
@@ -153,7 +156,7 @@ void IrcClient::parse_in_buffer(const size_t)
       else
         log_info("No handler for command " << message.command);
       // Try to find a waiting_iq, which response will be triggered by this IrcMessage
-      this->bridge->trigger_response_iq(this->hostname, message);
+      this->bridge->trigger_on_irc_message(this->hostname, message);
     }
 }
 
@@ -203,12 +206,14 @@ void IrcClient::send_quit_command(const std::string& reason)
   this->send_message(IrcMessage("QUIT", {reason}));
 }
 
-void IrcClient::send_join_command(const std::string& chan_name)
+void IrcClient::send_join_command(const std::string& chan_name, const std::string& password)
 {
   if (this->welcomed == false)
-    this->channels_to_join.push_back(chan_name);
-  else
+    this->channels_to_join.emplace_back(chan_name, password);
+  else if (password.empty())
     this->send_message(IrcMessage("JOIN", {chan_name}));
+  else
+    this->send_message(IrcMessage("JOIN", {chan_name, password}));
   this->start();
 }
 
@@ -240,7 +245,9 @@ void IrcClient::send_private_message(const std::string& username, const std::str
       this->send_message(IrcMessage(std::string(type), {username, body.substr(pos, 400)}));
       pos += 400;
     }
-
+  // We always try to insert and we don't care if the username was already
+  // in the set.
+  this->nicks_to_treat_as_private.insert(username);
 }
 
 void IrcClient::send_part_command(const std::string& chan_name, const std::string& status_message)
@@ -289,9 +296,28 @@ void IrcClient::on_notice(const IrcMessage& message)
   const std::string body = message.arguments[1];
 
   if (!to.empty() && this->chantypes.find(to[0]) == this->chantypes.end())
-    this->bridge->send_xmpp_message(this->hostname, from, body);
+    {
+      // The notice is for the us precisely.
+
+      // Find out if we already sent a private message to this user. If yes
+      // we treat that message as a private message coming from
+      // it. Otherwise we treat it as a notice coming from the server.
+      IrcUser user(from);
+      std::string nick = utils::tolower(user.nick);
+      if (this->nicks_to_treat_as_private.find(nick) !=
+          this->nicks_to_treat_as_private.end())
+        { // We previously sent a message to that nick)
+          this->bridge->send_message({nick + "!" + this->hostname}, nick, body,
+                                     false);
+        }
+      else
+        this->bridge->send_xmpp_message(this->hostname, from, body);
+    }
   else
     {
+      // The notice was directed at a channel we are in. Modify the message
+      // to indicate that it is a notice, and make it a MUC message coming
+      // from the MUC JID
       IrcMessage modified_message(std::move(from), "PRIVMSG", {to, "\u000303[notice]\u0003 "s + body});
       this->on_channel_message(modified_message);
     }
@@ -406,6 +432,9 @@ void IrcClient::on_channel_message(const IrcMessage& message)
                   "/me"s + body.substr(7, body.size() - 8), muc);
       else if (body.substr(1, 8) == "VERSION\01")
         this->bridge->send_iq_version_request(nick, this->hostname);
+      else if (body.substr(1, 5) == "PING ")
+        this->bridge->send_xmpp_ping_request(nick, this->hostname,
+                                             body.substr(6, body.size() - 7));
     }
   else
     this->bridge->send_message(iid, nick, body, muc);
@@ -475,6 +504,25 @@ void IrcClient::on_nickname_conflict(const IrcMessage& message)
   }
 }
 
+void IrcClient::on_nickname_change_too_fast(const IrcMessage& message)
+{
+  const std::string nickname = message.arguments[1];
+  std::string txt;
+  if (message.arguments.size() >= 3)
+    txt = message.arguments[2];
+  this->on_generic_error(message);
+  for (auto it = this->channels.begin(); it != this->channels.end(); ++it)
+  {
+    Iid iid;
+    iid.set_local(it->first);
+    iid.set_server(this->hostname);
+    iid.is_channel = true;
+    this->bridge->send_presence_error(iid, nickname,
+                                      "cancel", "not-acceptable",
+                                      "", txt);
+  }
+}
+
 void IrcClient::on_generic_error(const IrcMessage& message)
 {
   const std::string error_msg = message.arguments.size() >= 3 ?
@@ -489,8 +537,8 @@ void IrcClient::on_welcome_message(const IrcMessage& message)
   // Install a repeated events to regularly send a PING
   TimedEventsManager::instance().add_event(TimedEvent(240s, std::bind(&IrcClient::send_ping_command, this),
                                                       "PING"s + this->hostname + this->bridge->get_jid()));
-  for (const std::string& chan_name: this->channels_to_join)
-    this->send_join_command(chan_name);
+  for (const auto& tuple: this->channels_to_join)
+    this->send_join_command(std::get<0>(tuple), std::get<1>(tuple));
   this->channels_to_join.clear();
   // Indicate that the dummy channel is joined as well, if needed
   if (this->dummy_channel.joining)

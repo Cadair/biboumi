@@ -1,11 +1,11 @@
 Name:     biboumi
-Version:  1.0
-Release:  1%{?dist}
+Version:  1.1
+Release:  2%{?dist}
 Summary:  Lightweight XMPP to IRC gateway
 
 License:  zlib
 URL:      http://biboumi.louiz.org
-Source0:  http://biboumi.louiz.org/biboumi-1.0.tar.xz
+Source0:  http://git.louiz.org/biboumi/snapshot/biboumi-%{version}.tar.xz
 
 BuildRequires: libidn-devel
 BuildRequires: expat-devel
@@ -15,8 +15,8 @@ BuildRequires: cmake
 BuildRequires: systemd
 BuildRequires: rubygem-ronn
 
-%global biboumi_user    %{name}
-%global biboumi_group   %{biboumi_user}
+%global _hardened_build 1
+
 %global biboumi_confdir %{_sysconfdir}/%{name}
 
 
@@ -31,12 +31,18 @@ these channels were XMPP MUCs.
 
 
 %build
-cmake . -DCMAKE_BUILD_TYPE=release \
-    -DCMAKE_INSTALL_PREFIX=/usr \
-    -DPOLLER=EPOLL
+cmake . -DCMAKE_CXX_FLAGS="%{optflags}" \
+      -DCMAKE_BUILD_TYPE=release \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DPOLLER=EPOLL \
+      -DWITHOUT_BOTAN=1 \
+      -DWITH_SYSTEMD=1 \
+      -DWITH_LIBIDN=1
+
+make %{?_smp_mflags}
+
 # The documentation is in utf-8, ronn fails to build it if that locale is
 # not specified
-make %{?_smp_mflags}
 LC_ALL=en_GB.utf-8 make doc
 
 
@@ -50,14 +56,6 @@ install -D -p -m 644 conf/biboumi.cfg \
 # Systemd unit file
 install -D -p -m 644 unit/%{name}.service \
     %{buildroot}%{_unitdir}/%{name}.service
-
-
-%pre
-getent group %{biboumi_group} > /dev/null || groupadd -r %{biboumi_group}
-getent passwd %{biboumi_user} > /dev/null || \
-    useradd -r -g %{biboumi_group} \
-    -s /sbin/nologin -c "Biboumi XMPP to IRC gateway" %{biboumi_user}
-exit 0
 
 
 %check
@@ -75,5 +73,13 @@ make test_suite/fast VERBOSE=1
 
 
 %changelog
+* Wed Nov 13 2014 Le Coz Florent <louiz@louiz.org> - 1.1-2
+- Use the -DWITH(OUT) cmake flags for all optional dependencies
+- Build with the correct optflags
+- Use hardened_build
+
+* Wed Aug 18 2014 Le Coz Florent <louiz@louiz.org> - 1.1-1
+- Update to 1.1 release
+
 * Wed Jun 25 2014 Le Coz Florent <louiz@louiz.org> - 1.0-1
 - Spec file written from scratch

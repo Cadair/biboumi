@@ -48,7 +48,7 @@ public:
 class TCPSocketHandler: public SocketHandler
 {
 protected:
-  ~TCPSocketHandler() {}
+  ~TCPSocketHandler();
 
 public:
   explicit TCPSocketHandler(std::shared_ptr<Poller> poller);
@@ -58,16 +58,16 @@ public:
    * start_tls() when the connection succeeds.
    */
   void connect(const std::string& address, const std::string& port, const bool tls);
-  void connect();
+  void connect() override final;
   /**
    * Reads raw data from the socket. And pass it to parse_in_buffer()
    * If we are using TLS on this connection, we call tls_recv()
    */
-  void on_recv();
+  void on_recv() override final;
   /**
    * Write as much data from out_buf as possible, in the socket.
    */
-  void on_send();
+  void on_send() override final;
   /**
    * Add the given data to out_buf and tell our poller that we want to be
    * notified when a send event is ready.
@@ -111,11 +111,17 @@ public:
    * The size argument is the size of the last chunk of data that was added to the buffer.
    */
   virtual void parse_in_buffer(const size_t size) = 0;
-  bool is_connected() const;
+  bool is_connected() const override final;
   bool is_connecting() const;
 
 #ifdef CARES_FOUND
-  void fill_ares_addrinfo(const struct hostent* hostent);
+  void on_hostname4_resolved(int status, struct hostent* hostent);
+  void on_hostname6_resolved(int status, struct hostent* hostent);
+
+  void free_cares_addrinfo();
+
+  void fill_ares_addrinfo4(const struct hostent* hostent);
+  void fill_ares_addrinfo6(const struct hostent* hostent);
 #endif
 
 private:
@@ -238,6 +244,8 @@ protected:
    * Whether or not the DNS resolution was successfully done
    */
   bool resolved;
+  bool resolved4;
+  bool resolved6;
   /**
    * When using c-ares to resolve the host asynchronously, we need the
    * c-ares callback to fill a structure (a struct addrinfo, for
@@ -249,6 +257,7 @@ protected:
    * the members addrinfo, ai_addrlen, and ai_addr).
    */
   struct addrinfo* cares_addrinfo;
+  std::string cares_error;
 #endif  // CARES_FOUND
 
 private:
@@ -284,9 +293,5 @@ private:
   std::string pre_buf;
 #endif // BOTAN_FOUND
 };
-
-#ifdef CARES_FOUND
-void on_hostname_resolved(void* arg, int status, int timeouts, struct hostent* hostent);
-#endif
 
 #endif // SOCKET_HANDLER_INCLUDED

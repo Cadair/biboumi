@@ -11,8 +11,7 @@
 #include <signal.h>
 
 #ifdef CARES_FOUND
-# include <ares.h>
-# include <network/socket_handler.hpp>
+# include <network/dns_handler.hpp>
 #endif
 
 // A flag set by the SIGINT signal handler.
@@ -71,20 +70,6 @@ int main(int ac, char** av)
   if (hostname.empty())
     return config_help("hostname");
 
-#ifdef CARES_FOUND
-  int ares_error;
-  if ((ares_error = ares_library_init(ARES_LIB_INIT_ALL)) != 0)
-    {
-      log_error("Failed to initialize c-ares lib: " << ares_strerror(ares_error));
-      return -1;
-    }
-  if ((ares_error = SocketHandler::ares_init()) != ARES_SUCCESS)
-    {
-      log_error("Failed to initialize c-ares channel: " << ares_strerror(ares_error));
-      return -1;
-    }
-#endif
-
   auto p = std::make_shared<Poller>();
   auto xmpp_component = std::make_shared<XmppComponent>(p,
                                                         hostname,
@@ -113,6 +98,10 @@ int main(int ac, char** av)
 
   xmpp_component->start();
 
+
+#ifdef CARES_FOUND
+  DNSHandler::instance.watch_dns_sockets(p);
+#endif
   auto timeout = TimedEventsManager::instance().get_timeout();
   while (p->poll(timeout) != -1)
   {
@@ -126,6 +115,9 @@ int main(int ac, char** av)
       exiting = true;
       stop.store(false);
       xmpp_component->shutdown();
+#ifdef CARES_FOUND
+      DNSHandler::instance.destroy();
+#endif
       // Cancel the timer for an potential reconnection
       TimedEventsManager::instance().cancel("XMPP reconnection");
     }
@@ -171,6 +163,10 @@ int main(int ac, char** av)
       xmpp_component->close();
     if (exiting && p->size() == 1 && xmpp_component->is_document_open())
       xmpp_component->close_document();
+#ifdef CARES_FOUND
+    if (!exiting)
+      DNSHandler::instance.watch_dns_sockets(p);
+#endif
     if (exiting) // If we are exiting, do not wait for any timed event
       timeout = utils::no_timeout;
     else

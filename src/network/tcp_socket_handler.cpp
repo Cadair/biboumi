@@ -1,4 +1,5 @@
 #include <network/tcp_socket_handler.hpp>
+#include <network/dns_handler.hpp>
 
 #include <utils/timed_events.hpp>
 #include <utils/scopeguard.hpp>
@@ -32,22 +33,6 @@ Botan::TLS::Session_Manager_In_Memory TCPSocketHandler::session_manager(TCPSocke
 # define UIO_FASTIOV 8
 #endif
 
-#ifdef CARES_FOUND
-ares_channel SocketHandler::channel;
-
-void on_hostname_resolved(void* arg, int status, int timeouts, struct hostent* hostent)
-{
-  TCPSocketHandler* socket_handler = static_cast<TCPSocketHandler*>(arg);
-  if (status != ARES_SUCCESS)
-    {
-      socket_handler->close();
-      socket_handler->on_connection_failed(ares_strerror(status));
-      return;
-    }
-  socket_handler->fill_ares_addrinfo(hostent);
-}
-#endif
-
 using namespace std::string_literals;
 using namespace std::chrono_literals;
 
@@ -60,9 +45,19 @@ TCPSocketHandler::TCPSocketHandler(std::shared_ptr<Poller> poller):
   connecting(false)
 #ifdef CARES_FOUND
   ,resolved(false),
-  cares_addrinfo(nullptr)
+  resolved4(false),
+  resolved6(false),
+  cares_addrinfo(nullptr),
+  cares_error()
 #endif
 {}
+
+TCPSocketHandler::~TCPSocketHandler()
+{
+#ifdef CARES_FOUND
+  this->free_cares_addrinfo();
+#endif
+}
 
 void TCPSocketHandler::init_socket(const struct addrinfo* rp)
 {
@@ -92,22 +87,18 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
 
   if (!this->connecting)
     {
-      log_info("Trying to connect to " << address << ":" << port);
       // Get the addrinfo from getaddrinfo (or ares_gethostbyname), only if
       // this is the first call of this function.
 #ifdef CARES_FOUND
       if (!this->resolved)
         {
+          log_info("Trying to connect to " << address << ":" << port);
           // Start the asynchronous process of resolving the hostname. Once
           // the addresses have been found and `resolved` has been set to true
           // (but connecting will still be false), TCPSocketHandler::connect()
           // needs to be called, again.
-
-          // TODO use ares_getaddrinfo when it exist. Also use AF_UNSPEC in
-          // that case
-          log_debug("Start resolving " << address.data());
-          ares_gethostbyname(TCPSocketHandler::channel, address.data(), AF_INET,
-                             &on_hostname_resolved, this);
+          DNSHandler::instance.gethostbyname(address, this, AF_INET6);
+          DNSHandler::instance.gethostbyname(address, this, AF_INET);
           return;
         }
       else
@@ -116,8 +107,15 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
           // where saved in the cares_addrinfo linked list. Now, just use
           // this list to try to connect.
           addr_res = this->cares_addrinfo;
+          if (!addr_res)
+            {
+              this->close();
+              this->on_connection_failed(this->cares_error);
+              return ;
+            }
         }
 #else
+      log_info("Trying to connect to " << address << ":" << port);
       struct addrinfo hints;
       memset(&hints, 0, sizeof(struct addrinfo));
       hints.ai_flags = 0;
@@ -188,9 +186,9 @@ void TCPSocketHandler::connect(const std::string& address, const std::string& po
           // If the connection has not succeeded or failed in 5s, we consider
           // it to have failed
           TimedEventsManager::instance().add_event(
-                TimedEvent(std::chrono::steady_clock::now() + 5s,
-                           std::bind(&TCPSocketHandler::on_connection_timeout, this),
-                           "connection_timeout"s + std::to_string(this->socket)));
+                                                   TimedEvent(std::chrono::steady_clock::now() + 5s,
+                                                              std::bind(&TCPSocketHandler::on_connection_timeout, this),
+                                                              "connection_timeout"s + std::to_string(this->socket)));
           return ;
         }
       log_info("Connection failed:" << strerror(errno));
@@ -365,7 +363,11 @@ bool TCPSocketHandler::is_connected() const
 
 bool TCPSocketHandler::is_connecting() const
 {
+#ifdef CARES_FOUND
+  return this->connecting || !this->resolved;
+#else
   return this->connecting;
+#endif
 }
 
 void* TCPSocketHandler::get_receive_buffer(const size_t) const
@@ -457,15 +459,49 @@ void TCPSocketHandler::on_tls_activated()
 {
   this->send_data("");
 }
+
 #endif // BOTAN_FOUND
 
 #ifdef CARES_FOUND
-void TCPSocketHandler::fill_ares_addrinfo(const struct hostent* hostent)
+
+void TCPSocketHandler::on_hostname4_resolved(int status, struct hostent* hostent)
 {
-  struct addrinfo* prev = nullptr;
-  char** address = hostent->h_addr_list;
-  while (*address++)
+  this->resolved4 = true;
+  if (status == ARES_SUCCESS)
+    this->fill_ares_addrinfo4(hostent);
+  else
+    this->cares_error = ::ares_strerror(status);
+
+  if (this->resolved4 && this->resolved6)
     {
+      this->resolved = true;
+      this->connect();
+    }
+}
+
+void TCPSocketHandler::on_hostname6_resolved(int status, struct hostent* hostent)
+{
+  this->resolved6 = true;
+  if (status == ARES_SUCCESS)
+    this->fill_ares_addrinfo6(hostent);
+  else
+    this->cares_error = ::ares_strerror(status);
+
+  if (this->resolved4 && this->resolved6)
+    {
+      this->resolved = true;
+      this->connect();
+    }
+}
+
+void TCPSocketHandler::fill_ares_addrinfo4(const struct hostent* hostent)
+{
+  struct addrinfo* prev = this->cares_addrinfo;
+  struct in_addr** address = reinterpret_cast<struct in_addr**>(hostent->h_addr_list);
+
+  while (*address)
+    {
+       // Create a new addrinfo list element, and fill it
       struct addrinfo* current = new struct addrinfo;
       current->ai_flags = 0;
       current->ai_family = hostent->h_addrtype;
@@ -475,18 +511,62 @@ void TCPSocketHandler::fill_ares_addrinfo(const struct hostent* hostent)
 
       struct sockaddr_in* addr = new struct sockaddr_in;
       addr->sin_family = hostent->h_addrtype;
-      // only handle numeric port, not service names.
-      const uint16_t port = strtoul(this->port.data(), nullptr, 10);
-      addr->sin_port = htons(port);
-      addr->sin_addr.s_addr = reinterpret_cast<struct in_addr*>(address)->s_addr;
+      addr->sin_port = htons(strtoul(this->port.data(), nullptr, 10));
+      addr->sin_addr.s_addr = (*address)->s_addr;
+
       current->ai_addr = reinterpret_cast<struct sockaddr*>(addr);
       current->ai_next = nullptr;
       current->ai_canonname = nullptr;
-      if (prev)
-        prev->ai_next = current;
-      else
-        this->cares_addrinfo = current;
+
+      current->ai_next = prev;
+      this->cares_addrinfo = current;
       prev = current;
+      ++address;
     }
 }
+
+void TCPSocketHandler::fill_ares_addrinfo6(const struct hostent* hostent)
+{
+  struct addrinfo* prev = this->cares_addrinfo;
+  struct in6_addr** address = reinterpret_cast<struct in6_addr**>(hostent->h_addr_list);
+
+  while (*address)
+    {
+       // Create a new addrinfo list element, and fill it
+      struct addrinfo* current = new struct addrinfo;
+      current->ai_flags = 0;
+      current->ai_family = hostent->h_addrtype;
+      current->ai_socktype = SOCK_STREAM;
+      current->ai_protocol = 0;
+      current->ai_addrlen = sizeof(struct sockaddr_in6);
+
+      struct sockaddr_in6* addr = new struct sockaddr_in6;
+      addr->sin6_family = hostent->h_addrtype;
+      addr->sin6_port = htons(strtoul(this->port.data(), nullptr, 10));
+      ::memcpy(addr->sin6_addr.s6_addr, (*address)->s6_addr, 16);
+      addr->sin6_flowinfo = 0;
+      addr->sin6_scope_id = 0;
+
+      current->ai_addr = reinterpret_cast<struct sockaddr*>(addr);
+      current->ai_next = nullptr;
+      current->ai_canonname = nullptr;
+
+      current->ai_next = prev;
+      this->cares_addrinfo = current;
+      prev = current;
+      ++address;
+    }
+}
+
+void TCPSocketHandler::free_cares_addrinfo()
+{
+  while (this->cares_addrinfo)
+    {
+      delete this->cares_addrinfo->ai_addr;
+      auto next = this->cares_addrinfo->ai_next;
+      delete this->cares_addrinfo;
+      this->cares_addrinfo = next;
+    }
+}
+
 #endif  // CARES_FOUND
